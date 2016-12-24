@@ -487,7 +487,16 @@ end
 
 local check
 check = function (premature, ctx)
+    info("health_check_version 是 sssssssssssssssssssssss",ctx.health_check_version)
     if premature then
+        return
+    end
+    -- 检测 upstream 是否需要进行健康检查
+    local stop_version = ctx.dict:get(ctx.upstream..":stop_health_check_version")
+    debug("healthcheck status: ",stop_version)
+    if stop_version and stop_version >=  ctx.health_check_version then
+        warn("healthcheck need stop: ",stop_version)
+        update_upstream_checker_status(ctx.upstream, false)
         return
     end
 
@@ -506,6 +515,7 @@ check = function (premature, ctx)
         return
     end
 end
+
 
 local function preprocess_peers(peers)
     local n = #peers
@@ -537,6 +547,11 @@ function _M.spawn_checker(opts)
     local http_req = opts.http_req
     if not http_req then
         return nil, "\"http_req\" option required"
+    end
+
+    local health_check_version = opts.health_check_version
+    if not health_check_version then
+        return nil, "\"health_check_version\" option required"
     end
 
     local timeout = opts.timeout
@@ -607,6 +622,7 @@ function _M.spawn_checker(opts)
         return nil, "failed to get backup peers: " .. err
     end
 
+
     local ctx = {
         upstream = u,
         primary_peers = preprocess_peers(ppeers),
@@ -620,6 +636,7 @@ function _M.spawn_checker(opts)
         statuses = statuses,
         version = 0,
         concurrency = concur,
+        health_check_version = health_check_version,
     }
 
     local ok, err = new_timer(0, check, ctx)
@@ -646,6 +663,297 @@ local function gen_peers_status_info(peers, bits, idx)
         idx = idx + 3
     end
     return idx
+end
+
+
+
+function serialize(obj)  
+    local lua = ""  
+    local t = type(obj)  
+    if t == "number" then  
+        lua = lua .. obj  
+    elseif t == "boolean" then  
+        lua = lua .. tostring(obj)  
+    elseif t == "string" then  
+        lua = lua .. string.format("%q", obj)  
+    elseif t == "table" then  
+        lua = lua .. "{\n"  
+    for k, v in pairs(obj) do  
+        lua = lua .. "[" .. serialize(k) .. "]=" .. serialize(v) .. ",\n"  
+    end  
+    local metatable = getmetatable(obj)  
+        if metatable ~= nil and type(metatable.__index) == "table" then  
+        for k, v in pairs(metatable.__index) do  
+            lua = lua .. "[" .. serialize(k) .. "]=" .. serialize(v) .. ",\n"  
+        end  
+    end  
+        lua = lua .. "}"  
+    elseif t == "nil" then  
+        return nil  
+    else  
+        error("can not serialize a " .. t .. " type.")  
+    end  
+    return lua  
+end
+   
+function unserialize(lua)  
+    local t = type(lua)  
+    if t == "nil" or lua == "" then  
+        return nil  
+    elseif t == "number" or t == "string" or t == "boolean" then  
+        lua = tostring(lua)  
+    else  
+        error("can not unserialize a " .. t .. " type.")  
+    end  
+    lua = "return " .. lua  
+    local func = loadstring(lua)  
+    if func == nil then  
+        return nil  
+    end  
+    return func()  
+end  
+
+function _M.clear_legacy(ctx)
+    local upstream = ctx.upstream
+    if not upstream then
+        return nil, "\"upstream\" option required"
+    end
+    local shm = ctx.shm
+    if not shm then
+        return nil, "\"shm\" option required"
+    end
+    local dict = shared[shm]
+    if not dict then
+        return nil, "shm \"" .. tostring(shm) .. "\" not found"
+    end
+    local health_check_version = ctx.health_check_version 
+    if not health_check_version then
+        return nil, "\"health_check_version\" option required"
+    end
+    -- 停止已存在的 upstream healthcheck
+    local clear_legacy = ctx.clear_legacy
+    if clear_legacy then
+        local ok,err = dict:set(upstream..":stop_health_check_version",health_check_version)
+        if not ok then
+            error("clear_legacy stop ",upstream," healthcheck error: ",err)
+        else
+            info("clear_legacy stop ",upstream," healthcheck successed")
+        end
+    end
+end
+
+function _M.init_check(ctx)
+    local upstream = ctx.upstream
+    if not upstream then
+        return nil, "\"upstream\" option required"
+    end
+    local shm = ctx.shm
+    if not shm then
+        return nil, "\"shm\" option required"
+    end
+    local dict = shared[shm]
+    if not dict then
+        return nil, "shm \"" .. tostring(shm) .. "\" not found"
+    end
+    local init_check_flag = ctx.init_check
+    if not init_check_flag then
+        return nil, "\"init_check\" option required"
+    end
+
+    _M.clear_legacy(ctx)
+
+    local health_check = ctx.health_check
+    if not health_check then
+	-- 设置默认健康检查策略
+        local active = dict:get(upstream..":health_check:active")
+        if not active then
+            active = true
+        end
+        health_check = {active=active,type="http", http_req="GET /status?default999999999999 HTTP/1.0\r\nHost: foo.com\r\n\r\n",interval = 2000,timeout = 1000,fall = 3,rise = 2,valid_statuses = {200, 302}}
+    else
+        dict:set(upstream..":health_check:active",health_check["active"])
+    end
+    --info(upstream..":health_check",serialize(health_check))
+    local ok,err = dict:set(upstream..":health_check",serialize(health_check))
+    if not ok then
+        error("set "..upstream.."health_check error: ",err)
+    end
+
+    if init_check_flag == 0 then
+        local ok,err = dict:set(upstream..":init_check",init_check_flag)
+        warn("set kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"..upstream..":init_check ",init_check_flag)
+        if not ok then
+            error("set "..upstream..":init_check",init_check_flag)
+        end
+    end   
+end
+
+
+--为动态更新upstream列表加锁
+local function dy_get_lock(ctx)
+    local dict = ctx.dict
+    local key = "dy_l:dycheck"
+
+    -- the lock is held for the whole interval to prevent multiple
+    -- worker processes from sending the test request simultaneously.
+    -- here we substract the lock expiration time by 1ms to prevent
+    -- a race condition with the next timer event.
+    local ok, err = dict:add(key, true, ctx.interval - 0.001)
+    if not ok then
+        if err == "exists" then
+            return nil
+        end
+        errlog("failed to add key \"", key, "\": ", err)
+        return nil
+    end
+    return true
+end
+
+local dycheck
+dycheck = function (premature,ctx)
+    if premature then
+        return
+    end
+    -- 获取 upstream 列表
+    local get_upstreams = upstream.get_upstreams
+    local us = get_upstreams()
+
+    local shm = ctx.shm
+    if not shm then
+        return nil, "\"shm\" option required"
+    end
+    local dict = shared[shm]
+    if not dict then
+        return nil, "shm \"" .. tostring(shm) .. "\" not found"
+    end
+    ctx["dict"] = dict
+
+    local lock = dy_get_lock(ctx)
+    
+    if lock then
+      for _,u in ipairs(us) do
+        local health_check = dict:get(u..":health_check")
+
+        --info("health_check value: ",u," ",health_check)
+        local h = unserialize(health_check)
+        if not h or h["active"] ~= nil or h["active"] ~= false then
+            local type = "http"
+            local http_req = "GET /status HTTP/1.0\r\nHost: foo.com\r\n\r\n"
+            local interval = 2000
+            local timeout = 1000
+            local fall = 3
+            local rise = 2
+            local valid_statuses = {200, 302}
+
+            if h then
+                type = h["type"]
+                http_req = h["http_req"]
+                interval = h["interval"]
+                timeout = h["timeout"]
+                fall = h["fall"]
+                rise = h["rise"]
+                valid_statuses = h["valid_statuses"]
+            end
+            local opts = {
+                shm = shm,  -- defined by "lua_shared_dict"
+                upstream = u, -- defined by "upstream"
+                type = type,
+
+                http_req = http_req,
+                -- raw HTTP request for checking
+
+                interval = interval,  -- run the check cycle every 2 sec
+                timeout = timeout,   -- 1 sec is the timeout for network operations
+                fall = fall,  -- # of successive failures before turning a peer down
+                rise = rise,  -- # of successive successes before turning a peer up
+                valid_statuses = valid_statuses,  -- a list valid HTTP status code
+                concurrency = 10,  -- concurrency level for test requests
+            }
+
+            -- 获取当前upstream是否已经在健康检查
+            local flag = dict:get(u..":init_check")
+            if not flag or flag ~= 1 then
+                 -- 设置健康检查的版本（upstream维度）
+                local health_check_version_key = u..":health_check_version"
+                local health_check_version = dict:incr(health_check_version_key,1)
+                if not health_check_version then
+                    health_check_version = 1
+                        dict:set(health_check_version_key,1)
+                end
+                opts["health_check_version"] = health_check_version
+                info("upstream check: ",u," is added ",flag," " ,serialize(opts))
+                local ok, err = pcall(_M.spawn_checker, opts)
+                if not ok then
+                    errlog("failed to run healthcheck cycle: ", u , " : ",err)
+                else
+                    local ok = dict:set(u..":init_check",1)
+                end
+            else
+                info("upstream check: ",u," is already")
+            end
+        elseif h["active"] == false then
+            dict:set(u..":stop_version",0)
+        end
+      end
+    end
+    local ok, err = new_timer(ctx.interval, dycheck, ctx)
+    if not ok then
+        if err ~= "process exiting" then
+            errlog("failed to create timer: ", err)
+        end
+    end
+end
+
+function _M.dyspawn_checker(opts)
+    local shm = opts.shm
+    if not shm then
+        return nil, "\"shm\" option required"
+    end
+    local interval = opts.interval
+    if not interval then
+        interval = 1
+
+    else
+        interval = interval / 1000
+        if interval < 0.002 then  -- minimum 2ms
+            interval = 0.002
+        end
+    end
+
+    local init_check = opts.init_check
+    if not init_check then
+        return nil, "\"init_check\" option required"
+    end
+
+
+    local health_check = opts.health_check 
+
+    local ctx = {
+         shm = shm,
+         interval = interval,
+         init_check = init_check,
+         health_check = health_check,
+    }
+    if init_check == 0 then
+        -- 获取 upstream 列表
+        local get_upstreams = upstream.get_upstreams
+        local us = get_upstreams()
+        for _,u in pairs(us) do
+            info("init_upstream: ",u,serialize(health_check))
+            _M.init_check{
+                upstream= u,
+                init_check = init_check,
+                shm = shm,
+                health_check = health_check,
+            }
+        end
+    end
+
+    local ok, err = new_timer(0, dycheck, ctx)
+    if not ok then
+        return nil, "failed to create timer: " .. err
+    end
+    return true
 end
 
 function _M.status_page()
@@ -681,8 +989,10 @@ function _M.status_page()
 
         local peers, err = get_primary_peers(u)
         if not peers then
-            return "failed to get primary peers in upstream " .. u .. ": "
-                   .. err
+            -- 不能用return，在使用 dyups 模块时会出现 peers 为空的情况
+            --return "failed to get primary peers in upstream " .. u .. ": ".. err
+            ngx.say(u)
+            break
         end
 
         idx = gen_peers_status_info(peers, bits, idx)
@@ -701,4 +1011,30 @@ function _M.status_page()
     return concat(bits)
 end
 
+function _M.get_upstream_info(ctx)
+       info("uuuuuuuuuuuuuuuu",serialize(ctx))
+       local shm = ctx.shm
+       if not shm then
+            return nil, "\"shm\" option required"
+       end
+       local dict = shared[shm]
+       if not dict then
+            return nil, "shm \"" .. tostring(shm) .. "\" not found"
+       end
+       local key = ctx.key
+       if not key then
+           return nil,"\"key\" option required"
+       end
+       local upstream = ctx.upstream 
+       if not upstream then
+              return nil,"\"upstream\" option required"
+       end 
+       local value,err = dict:get(upstream..':'..key)
+       if not value then
+               return nil,err
+       end
+       return value,nil
+end
+
 return _M
+
